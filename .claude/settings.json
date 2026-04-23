@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/pip index *)",
+      "Bash(.venv/bin/pip install *)"
+    ]
+  }
+}
