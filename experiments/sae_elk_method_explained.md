@@ -309,3 +309,52 @@ The headline comparison (AO's own reported channel, `oracle_response` =
 
 overall accuracy:   5/18 = 27.8%
  -->
+
+## Comparison to the original SAE-elicitation setting (`eliciting-secret-knowledge/elicitation_methods/sae.py`)
+
+So do you think their setting was better? **Yes — their setting was methodologically stronger than ours, for four reasons. Our setting is a shortcut that makes the task easier in some ways and harsher in others, but not comparable to theirs.**
+
+1. **Where the SAE reads from.** Theirs encodes features on the **generated response tokens** (the model actually produces a hint, then SAE reads those activations). Ours encodes on the **prompt + assistant-prefill tokens** before any generation. Theirs measures "what did the model leak when it spoke"; ours measures "what is the model about to say" — the latter is easier because an assistant prefill like `"The word is"` or `"It rhymes with"` already points the residual stream at the secret.
+
+2. **Prompt coverage and volume.** Theirs uses 100 `taboo_standard_test.txt` (benign hint-requests) + 100 `taboo_direct_test.txt` (adversarial / jailbreak direct-asks) = **200 prompts per word**. Ours uses **6 prefill-paired prompts** drawn from `build_taboo_graphs.PROMPT_PAIRS`. Their per-word estimate has ~30× lower variance and covers both cooperative and adversarial elicitation regimes; ours is basically one regime (prefill-induced naming).
+
+3. **No prefill in theirs.** Their prompts are plain user messages — no assistant-side nudge. Our prefill gives the model a running start toward the secret, which inflates any elicitation method that reads from the prefill region. This is an unfair boost that their setup doesn't give the SAE.
+
+4. **Auditor vs. regex.** Theirs feeds the top features/tokens (and their descriptions) into an **LLM auditor** that guesses the secret; scored on auditor guess vs. truth. Ours does whole-word regex matching on the concatenated top-10 tokens of the top-10 features. Regex is strictly harsher: if the secret is `wave` and the SAE's top tokens include `waves ocean surf rhyme ...`, the auditor would happily guess `wave`, but the regex misses it.
+
+**Net effect:** our setting *helps* the SAE on axis (1) and (3) — prefill-based readout is an easier regime — but *hurts* the SAE on axis (4) — regex decoding is stricter than an LLM auditor. On axis (2) our numbers are just noisier. None of these cancel cleanly, so our SAE accuracies are not directly comparable to the numbers reported in the original paper. For a faithful reproduction we would need to (a) drop the prefill and use `taboo_standard_test.txt` + `taboo_direct_test.txt`, (b) encode features on the generated response rather than the prompt, and (c) add an auditor step on top of the top-feature/token output.
+
+The reason we deviated is that our goal here isn't to reproduce the original SAE numbers — it's to see how the SAE method performs **in exactly the setting where the activation-oracle method is evaluated**, so the AO vs. SAE comparison is apples-to-apples within this file. That aim is served by matching AO's prompt format (prefill + segment readout), even though it makes the SAE numbers non-comparable to the original paper.
+
+## Why this method does not transfer to the Qwen3-8B MLP transcoders
+
+We also tried `mwhanna/qwen3-8b-transcoders` at the same three layers, with the same pipeline (`experiments/elk_using_qwen3_8b_transcoder.py`). What we verified, in order:
+
+1. **The transcoder itself is loaded and run correctly.** A reconstruction sanity check (`experiments/_transcoder_sanity.py`) shows that `decode(encode(mlp_in)) ≈ mlp_out` with explained variance ≈ 0.59 at layer 18, L0 ≈ 80 / 163 840. Encode formula: `relu(x @ W_enc.T + b_enc)`, no `b_dec` input centering — the centered variant gives EV 0.46, strictly worse.
+
+2. **Per-feature density data is shipped with the transcoder.** `mwhanna/qwen3-8b-transcoders` includes `features/layer_N.bin` files containing per-feature `activation_frequency` (the moral equivalent of Neuronpedia's `frac_nonzero`), computed by the transcoder authors on a real corpus. We load these directly via `load_published_densities` — no calibration on eval prompts — exactly mirroring what `eliciting-secret-knowledge/elicitation_methods/sae.py` does for GemmaScope SAEs. So the densities used here are as principled as the reference paper's.
+
+3. **Even with proper densities, the elicitation output is uninformative noise.** The same handful of feature clusters dominate every word and prompt; none thematically aligned with the secret. So the failure is *not* about density estimation — it is structural to the read location.
+
+Concretely, on the 8-word eval slice used elsewhere in this doc (`smile`, `leaf`, `gold`, `blue`, `book`, `salt`, `chair`, `clock` × 6 prompts each = 48 runs), the headline `oracle_response` channel scores:
+
+| method                       | TOTAL hits / runs | accuracy |
+|------------------------------|:-----------------:|:--------:|
+| activation_oracle            | 33/48             | 68.8 %   |
+| sae_layer9 + TF-IDF          | 6/48              | 12.5 %   |
+| sae_layer18 + TF-IDF         | 5/48              | 10.4 %   |
+| sae_layer27 + TF-IDF         | 4/48              |  8.3 %   |
+| **transcoder_layer9 + TF-IDF**  | **0/48**       | **0.0 %**   |
+| **transcoder_layer18 + TF-IDF** | **0/48**       | **0.0 %**   |
+| **transcoder_layer27 + TF-IDF** | **0/48**       | **0.0 %**   |
+| oracle_taboo (paper baseline)| 15/48             | 31.2 %   |
+
+The SAE numbers degrade smoothly with layer depth (12.5 → 10.4 → 8.3 %), consistent with "earlier residual-stream features carry more about the upcoming secret token, since later layers have already started suppressing it." The transcoder is flat at zero across all three layers — no depth signal at all, because the failure mode (template-feature domination at MLP input) is layer-independent.
+
+The actual failure mode is **chat-template feature domination at MLP input**. The prefill segment we average over is `<|im_end|>\n<|im_start|>assistant\n\n{prefill}` — mostly chat-template tokens that are identical across every prompt. At `layers[L].mlp.hook_in`, the features that fire most strongly on those positions are template-detection features (end-of-turn markers, assistant header, sentence openers). Those features are *also* rare in Neuronpedia-style pretraining-corpus densities, since pretraining is mostly raw text rather than chat-formatted dialogue, so they pick up high IDF *and* high TF and dominate the ranking.
+
+The SAE script has the same template-domination problem at `residual_post`, but is partially rescued by a property the transcoder doesn't have: the residual stream at the prefill position already carries the downstream "concept of the secret about to be named" signal that the model's later layers will use to actually emit the secret. MLP-input doesn't carry that — by construction it sits *before* layer L's MLP has done any work, so any "I'm about to say WORD" signal that this MLP would have written into the residual stream lives in `mlp.hook_out`, not `hook_in`. Reading `hook_out` is not what the transcoder was trained for, so we cannot just swap hooks.
+
+In short: the transcoder is wired into the wrong place in the residual stream for prefill-based readout. To make this elicitation method work for transcoders, we would need to either (a) read from the *generated response tokens* rather than the prefill segment (matching what `eliciting-secret-knowledge` does — see four-axis comparison above), so the model has already committed to producing the secret and the relevant concept features fire at the *generation* hook positions; or (b) sum transcoder feature contributions across multiple layers (a "circuit" rather than a single-layer probe) so the secret-encoding MLP outputs at layers > L are actually included in the readout. Both are real method changes, not configuration tweaks.
+
+We report the negative result here rather than swapping methodology, because what it actually tells us is concrete: *for prefill-segment readout, MLP-input transcoders are the wrong tool — the relevant signal is downstream of where they read.*
