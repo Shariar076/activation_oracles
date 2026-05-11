@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python --version)",
+      "Bash(.venv/bin/pip show *)",
+      "Bash(nvidia-smi)",
+      "Bash(python *)",
+      "Bash(.venv/bin/python *)",
+      "Bash(.venv/bin/jupyter nbconvert *)",
+      "Read(//tmp/**)",
+      "Bash(.venv/bin/pip list *)",
+      "Bash(python3 *)",
+      "Bash(curl -sL \"https://www.neuronpedia.org/api/feature/gemma-2-2b/22-gemmascope-transcoder-16k/0\")",
+      "Bash(curl -sL \"https://huggingface.co/adamkarvonen/qwen3-8b-saes/resolve/main/saes_Qwen_Qwen3-8B_batch_top_k/resid_post_layer_18/trainer_2/eval_results.json\")",
+      "Bash(sh print_table.sh)"
+    ]
+  }
+}

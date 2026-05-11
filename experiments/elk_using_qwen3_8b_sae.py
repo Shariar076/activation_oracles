@@ -208,10 +208,10 @@ def features_to_response(sae, embed_weight, feature_indices, top_k_tokens, token
 
 
 def rank_features(activations_LF: torch.Tensor, densities: torch.Tensor | None,
-                  use_tfidf: bool, top_k: int) -> list[int]:
-    """activations_LF: [n_positions, d_sae]. Returns top-k feature indices."""
+                  use_tfidf: bool, top_k: int) -> tuple[list[int], torch.Tensor | None]:
+    """activations_LF: [n_positions, d_sae]. Returns (top-k indices, top-k scores)."""
     if activations_LF.shape[0] == 0:
-        return []
+        return [], None
     mean_acts = activations_LF.mean(dim=0).float()
     if use_tfidf and densities is not None:
         idf = torch.log(1.0 / (densities.to(mean_acts.device) + 1e-8))
@@ -219,7 +219,47 @@ def rank_features(activations_LF: torch.Tensor, densities: torch.Tensor | None,
     else:
         scores = mean_acts
     k = min(top_k, scores.numel())
-    return scores.topk(k).indices.tolist()
+    top = scores.topk(k)
+    return top.indices.tolist(), top.values.detach()
+
+
+def candidate_token_ids(tokenizer, words: list[str]) -> list[list[int]]:
+    """For each candidate word, collect plausible single-token ids covering
+    leading-space and capitalized variants. Closed-mode scoring takes max
+    over these per word."""
+    out = []
+    for w in words:
+        ids: set[int] = set()
+        for variant in (" " + w, w, " " + w.capitalize(), w.capitalize()):
+            tok = tokenizer.encode(variant, add_special_tokens=False)
+            if len(tok) == 1:
+                ids.add(int(tok[0]))
+        if not ids:
+            ids.add(int(tokenizer.encode(" " + w, add_special_tokens=False)[0]))
+        out.append(sorted(ids))
+    return out
+
+
+def predict_closed(W_dec: torch.Tensor, embed_weight: torch.Tensor,
+                   feature_indices: list[int], feature_scores: torch.Tensor | None,
+                   candidate_ids: list[list[int]], words: list[str]
+                   ) -> tuple[str | None, str | None, list[float]]:
+    """Score each candidate word by sum_F score[F] * (W_dec[F] @ E[token]),
+    taking max over each word's tokenizations. Returns (top_word, runner_up,
+    per-candidate score list aligned with `words`)."""
+    if not feature_indices or feature_scores is None:
+        return None, None, [0.0] * len(words)
+    device = W_dec.device
+    idx_t = torch.tensor(feature_indices, device=device, dtype=torch.long)
+    feats = W_dec.index_select(0, idx_t).float()                    # [K, d]
+    weighted = (feats * feature_scores.float().to(device).unsqueeze(-1)).sum(dim=0)  # [d]
+    logits = embed_weight.float().to(device) @ weighted             # [vocab]
+    cand_scores = [float(logits[torch.tensor(ids, device=device)].max().item())
+                   for ids in candidate_ids]
+    order = sorted(range(len(words)), key=lambda i: cand_scores[i], reverse=True)
+    top = words[order[0]]
+    runner = words[order[1]] if len(order) > 1 else None
+    return top, runner, cand_scores
 
 
 def main():
@@ -232,6 +272,9 @@ def main():
     ap.add_argument("--top_k_tokens", type=int, default=10)
     ap.add_argument("--use_tfidf", action="store_true",
                     help="Weight feature scores by log(1/density); density calibrated on PROMPTS with no LoRA.")
+    ap.add_argument("--mode", choices=["open", "closed"], default="open",
+                    help="open: emit decoded vocab tokens (current behaviour). "
+                         "closed: predict 1-of-20 candidate words via decoder→embedding scoring.")
     ap.add_argument("--output", type=Path, default=None)
     ap.add_argument("--limit_words", type=int, default=None,
                     help="Only run the first N words (for quick smoke tests).")
@@ -245,7 +288,9 @@ def main():
 
     out_path = args.output or (
         Path(__file__).resolve().parent
-        / f"sae_elk_results_layer{args.layer}{'_tfidf' if args.use_tfidf else ''}.json"
+        / f"sae_elk_results_layer{args.layer}"
+          f"{'_tfidf' if args.use_tfidf else ''}"
+          f"{'_closed' if args.mode == 'closed' else ''}.json"
     )
 
     print(f"Loading tokenizer + model: {MODEL_NAME}")
@@ -268,6 +313,8 @@ def main():
     print(f"embed_weight shape: {tuple(embed_weight.shape)} | sae.W_dec shape: {tuple(sae.W_dec.shape)}")
 
     submod = get_submodule(model, args.layer)
+
+    cand_ids = candidate_token_ids(tokenizer, WORDS) if args.mode == "closed" else None
 
     # ---- Optional calibration pass: feature densities on base model over PROMPTS ----
     densities: torch.Tensor | None = None
@@ -321,20 +368,33 @@ def main():
             seg_e = seq_len if seg_end is None else seg_end
 
             # Segment aggregate (primary)
-            seg_idx = rank_features(enc[seg_start:seg_e], densities, args.use_tfidf, args.top_k_features)
-            seg_response = features_to_response(sae, embed_weight, seg_idx, args.top_k_tokens, tokenizer)
-
+            seg_idx, seg_scores = rank_features(enc[seg_start:seg_e], densities, args.use_tfidf, args.top_k_features)
             # Full-sequence aggregate
-            full_idx = rank_features(enc, densities, args.use_tfidf, args.top_k_features)
-            full_response = features_to_response(sae, embed_weight, full_idx, args.top_k_tokens, tokenizer)
+            full_idx, full_scores = rank_features(enc, densities, args.use_tfidf, args.top_k_features)
 
-            # Per-token (only within the segment — matches AO's token_responses shape)
-            token_responses: list[str | None] = [None] * seq_len
-            for i in range(seg_start, seg_e):
-                tok_idx = rank_features(enc[i:i + 1], densities, args.use_tfidf, args.top_k_features)
-                token_responses[i] = features_to_response(
-                    sae, embed_weight, tok_idx, args.top_k_tokens, tokenizer
+            seg_pred = full_pred = None
+            seg_runner = full_runner = None
+            seg_cand_scores = full_cand_scores = None
+
+            if args.mode == "open":
+                seg_response = features_to_response(sae, embed_weight, seg_idx, args.top_k_tokens, tokenizer)
+                full_response = features_to_response(sae, embed_weight, full_idx, args.top_k_tokens, tokenizer)
+                token_responses: list[str | None] = [None] * seq_len
+                for i in range(seg_start, seg_e):
+                    tok_idx, _ = rank_features(enc[i:i + 1], densities, args.use_tfidf, args.top_k_features)
+                    token_responses[i] = features_to_response(
+                        sae, embed_weight, tok_idx, args.top_k_tokens, tokenizer
+                    )
+            else:  # closed
+                seg_pred, seg_runner, seg_cand_scores = predict_closed(
+                    sae.W_dec, embed_weight, seg_idx, seg_scores, cand_ids, WORDS
                 )
+                full_pred, full_runner, full_cand_scores = predict_closed(
+                    sae.W_dec, embed_weight, full_idx, full_scores, cand_ids, WORDS
+                )
+                seg_response = seg_pred or ""
+                full_response = full_pred or ""
+                token_responses = [None] * seq_len
 
             print(f"[{run_idx}/{total}] word={word!r} prompt={prompt_text!r} "
                   f"seg=[{seg_start}:{seg_end}] -> {seg_response!r}")
@@ -352,7 +412,17 @@ def main():
                 "segment_responses": [seg_response],
                 "full_sequence_responses": [full_response],
                 "token_responses": token_responses,
-                "method": f"sae_layer{args.layer}_w{args.sae_width}" + ("_tfidf" if args.use_tfidf else ""),
+                "method": f"sae_layer{args.layer}_w{args.sae_width}"
+                          + ("_tfidf" if args.use_tfidf else "")
+                          + ("_closed" if args.mode == "closed" else ""),
+                "mode": args.mode,
+                "prediction": seg_pred,
+                "runner_up": seg_runner,
+                "candidate_scores": (
+                    {w: s for w, s in zip(WORDS, seg_cand_scores)} if seg_cand_scores else None
+                ),
+                "full_prediction": full_pred,
+                "full_runner_up": full_runner,
             })
             with open(out_path, "w") as f:
                 json.dump(all_results, f, indent=2)
